@@ -1,1 +1,0 @@
-cmd_/home/msi/Desktop/Project/ldd/final/adxl_i2c_driver.ko := arm-linux-gnueabihf-ld -r -EL -T ./scripts/module-common.lds -T ./arch/arm/kernel/module.lds  --build-id  -o /home/msi/Desktop/Project/ldd/final/adxl_i2c_driver.ko /home/msi/Desktop/Project/ldd/final/adxl_i2c_driver.o /home/msi/Desktop/Project/ldd/final/adxl_i2c_driver.mod.o ;  true
