@@ -6,34 +6,44 @@
 #include <linux/kernel.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
-#include <linux/i2c-dev.h>
-
+#include <linux/uaccess.h>
 
 #define I2C_BUS_AVAILABLE   (2)
-#define SLAVE_DEVICE_NAME   ("ADXL345")
+#define SLAVE_DEVICE_NAME   "ADXL345"
 #define adxl_SLAVE_ADDR     (0x53)
 
-#define FIFO_WATERMARK_LEVEL 0x1F // Define the FIFO watermark level
+#define ADXL_REG_DATA_FORMAT  0x31
+#define ADXL_REG_POWER_CTL    0x2D
+#define ADXL_REG_BW_RATE      0x2C
+#define ADXL_REG_FIFO_CTL     0x38
+#define ADXL_REG_DATAX0       0x32
 
-static struct i2c_adapter *adxl_i2c_adapter = NULL;
+#define FIFO_WATERMARK_LEVEL  0x1F
+
 static struct i2c_client *adxl_i2c_client = NULL;
-static int major;  // Declare major and minor here
-static int minor;
-static dev_t dev_number; // Declare dev_number here
+static dev_t dev_number;
+static struct cdev adxl_cdev;
+static struct class *adxl_class;
 
-static const unsigned short i2c_addresses[] = {
-    adxl_SLAVE_ADDR,
-    I2C_CLIENT_END
+struct adxl345_config {
+    uint8_t data_format;
+    uint8_t power_ctl;
+    uint8_t bw_rate;
+    uint8_t fifo_ctl;
 };
 
+// Default configuration
+static struct adxl345_config adxl_config = {
+    .data_format = 0x0B, // Full resolution, ±16g
+    .power_ctl = 0x08,   // Measurement mode
+    .bw_rate = 0x0A,     // 100 Hz
+    .fifo_ctl = 0x80 | FIFO_WATERMARK_LEVEL // FIFO enabled, watermark level set
+};
 
-static int I2C_Write(struct i2c_client *client, unsigned char reg_addr, unsigned char *buf, unsigned int len)
-{
-    int ret;
+static int I2C_Write(struct i2c_client *client, unsigned char reg_addr, unsigned char *buf, unsigned int len) {
     struct i2c_msg msg;
-
     msg.addr = client->addr;
-    msg.flags = 0; // Write
+    msg.flags = 0;
     msg.len = len + 1;
     msg.buf = kmalloc(msg.len, GFP_KERNEL);
 
@@ -42,99 +52,106 @@ static int I2C_Write(struct i2c_client *client, unsigned char reg_addr, unsigned
 
     msg.buf[0] = reg_addr;
     memcpy(&msg.buf[1], buf, len);
-
-    ret = i2c_transfer(client->adapter, &msg, 1);
+    int ret = i2c_transfer(client->adapter, &msg, 1);
 
     kfree(msg.buf);
-
-    if (ret < 0)
-        pr_err("I2C Write error: %d\n", ret);
-
     return ret;
 }
 
-static int I2C_Read(struct i2c_client *client, unsigned char reg_addr, unsigned char *out_buf, unsigned int len)
-{
-    int ret;
-    struct i2c_msg msg[2];
-
-    msg[0].addr = client->addr;
-    msg[0].flags = 0; // Write
-    msg[0].len = 1;
-    msg[0].buf = &reg_addr;
-
-    msg[1].addr = client->addr;
-    msg[1].flags = I2C_M_RD; // Read
-    msg[1].len = len;
-    msg[1].buf = out_buf;
-
-    ret = i2c_transfer(client->adapter, msg, 2);
-
-    if (ret < 0)
-        pr_err("I2C Read error: %d\n", ret);
-
-    return ret;
+static int I2C_Read(struct i2c_client *client, unsigned char reg_addr, unsigned char *out_buf, unsigned int len) {
+    struct i2c_msg msg[2] = {
+        { .addr = client->addr, .flags = 0, .len = 1, .buf = &reg_addr },
+        { .addr = client->addr, .flags = I2C_M_RD, .len = len, .buf = out_buf }
+    };
+    return i2c_transfer(client->adapter, msg, 2);
 }
 
+// Read sensor data
+static ssize_t adxl_read(struct file *file, char __user *user_buf, size_t count, loff_t *offset) {
+    uint8_t data[6];
+    int16_t x, y, z;
 
-static int adxl_probe(struct i2c_client *client, const struct i2c_device_id *id)
-{
-    unsigned char data[2];
-    unsigned char fifo_data[6 * FIFO_WATERMARK_LEVEL];			//Since each entry in the FIFO buffer consists of three axes of acceleration data (X, Y, and Z), 
-																//and each axis is represented by 2 bytes (16 bits),you need 6 bytes to represent one entry. 
-																//Therefore, multiplying the watermark level by 6 gives you the total number of bytes needed 
-																//to store the data samples up to the watermark level.
-    int i;
+    if (I2C_Read(adxl_i2c_client, ADXL_REG_DATAX0, data, 6) < 0)
+        return -EIO;
 
-    unsigned char fifo_status;
+    x = (int16_t)(data[0] | (data[1] << 8));
+    y = (int16_t)(data[2] | (data[3] << 8));
+    z = (int16_t)(data[4] | (data[5] << 8));
 
-    pr_info("ADXL345 Probed!!!\n");
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "X: %d, Y: %d, Z: %d\n", x, y, z);
 
-    // Configure Data Format (Full Resolution, +/- 16g range)
-    data[0] = 0x31; // Data Format register
-    data[1] = 0x0B; // Set full resolution and range
-    I2C_Write(client, data[0], &data[1], 1);
+    if (copy_to_user(user_buf, buf, len))
+        return -EFAULT;
 
-    // Set Power Mode (Measurement mode)
-    data[0] = 0x2D; // Power Control register
-    data[1] = 0x08; // Set measurement mode
-    I2C_Write(client, data[0], &data[1], 1);
+    return len;
+}
 
-    msleep(100); // Delay for sensor stabilization
+// Write configuration
+static ssize_t adxl_write(struct file *file, const char __user *user_buf, size_t count, loff_t *offset) {
+    struct adxl345_config new_config;
 
-    // Configure FIFO Mode and Watermark Level
-    data[0] = 0x38; // FIFO Control register
-    data[1] = 0x80 | FIFO_WATERMARK_LEVEL; // Set FIFO mode and watermark level
-    I2C_Write(client, data[0], &data[1], 1);
+    if (copy_from_user(&new_config, user_buf, sizeof(new_config)))
+        return -EFAULT;
 
-    msleep(100); // Allow time for FIFO to fill
+    I2C_Write(adxl_i2c_client, ADXL_REG_DATA_FORMAT, &new_config.data_format, 1);
+    I2C_Write(adxl_i2c_client, ADXL_REG_POWER_CTL, &new_config.power_ctl, 1);
+    I2C_Write(adxl_i2c_client, ADXL_REG_BW_RATE, &new_config.bw_rate, 1);
+    I2C_Write(adxl_i2c_client, ADXL_REG_FIFO_CTL, &new_config.fifo_ctl, 1);
 
-    // Read FIFO Data
-    I2C_Read(client, 0x39, &fifo_status, 1); // Read FIFO status register
+    memcpy(&adxl_config, &new_config, sizeof(new_config));
+    return count;
+}
 
-    int fifo_entries = fifo_status & 0x3F; // Extract number of entries in FIFO
+static long adxl_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    struct adxl345_config config;
 
-    if (fifo_entries > 0) {
-        I2C_Read(client, 0x32, fifo_data, 6 * fifo_entries);
-
-        for (i = 0; i < fifo_entries; ++i) {
-            int16_t x_accel = (int16_t)(fifo_data[i * 6] | (fifo_data[i * 6 + 1] << 8));
-            int16_t y_accel = (int16_t)(fifo_data[i * 6 + 2] | (fifo_data[i * 6 + 3] << 8));
-            int16_t z_accel = (int16_t)(fifo_data[i * 6 + 4] | (fifo_data[i * 6 + 5] << 8));
-
-            pr_info("FIFO Entry %d - X: %hd, Y: %hd, Z: %hd\n", i, x_accel, y_accel, z_accel);
-        }
+    switch (cmd) {
+        case 1: // Get config
+            if (copy_to_user((void __user *)arg, &adxl_config, sizeof(adxl_config)))
+                return -EFAULT;
+            break;
+        case 2: // Set config
+            if (copy_from_user(&config, (void __user *)arg, sizeof(config)))
+                return -EFAULT;
+            return adxl_write(file, (char *)&config, sizeof(config), 0);
+        default:
+            return -EINVAL;
     }
 
-    // Return success
     return 0;
 }
 
+static struct file_operations fops = {
+    .owner   = THIS_MODULE,
+    .read    = adxl_read,
+    .write   = adxl_write,
+    .unlocked_ioctl = adxl_ioctl,
+};
 
+static int adxl_probe(struct i2c_client *client, const struct i2c_device_id *id) {
+    adxl_i2c_client = client;
 
-static int adxl_remove(struct i2c_client *client)
-{
-    pr_info("ADXL345 Removed!!!\n");
+    // Apply default configuration
+    adxl_write(NULL, (char *)&adxl_config, sizeof(adxl_config), 0);
+
+    // Register char device
+    alloc_chrdev_region(&dev_number, 0, 1, SLAVE_DEVICE_NAME);
+    cdev_init(&adxl_cdev, &fops);
+    cdev_add(&adxl_cdev, dev_number, 1);
+    adxl_class = class_create(THIS_MODULE, SLAVE_DEVICE_NAME);
+    device_create(adxl_class, NULL, dev_number, NULL, SLAVE_DEVICE_NAME);
+
+    pr_info("ADXL345 driver loaded\n");
+    return 0;
+}
+
+static int adxl_remove(struct i2c_client *client) {
+    device_destroy(adxl_class, dev_number);
+    class_destroy(adxl_class);
+    cdev_del(&adxl_cdev);
+    unregister_chrdev_region(dev_number, 1);
+    pr_info("ADXL345 driver removed\n");
     return 0;
 }
 
@@ -142,76 +159,17 @@ static const struct i2c_device_id adxl_id[] = {
     { SLAVE_DEVICE_NAME, 0 },
     { }
 };
-MODULE_DEVICE_TABLE(i2c, adxl_id);
 
 static struct i2c_driver adxl_driver = {
-    .driver = {
-        .name   = SLAVE_DEVICE_NAME,
-        .owner  = THIS_MODULE,
-    },
-    .probe          = adxl_probe,
-    .remove         = adxl_remove,
-    .id_table       = adxl_id,
+    .driver = { .name = SLAVE_DEVICE_NAME },
+    .probe = adxl_probe,
+    .remove = adxl_remove,
+    .id_table = adxl_id,
 };
 
-static struct i2c_board_info adxl_i2c_board_info = {
-    I2C_BOARD_INFO(SLAVE_DEVICE_NAME, adxl_SLAVE_ADDR)
-};
-
-
-static int adxl_driver_init(void)
-{
-    int ret = -1;
-    adxl_i2c_adapter = i2c_get_adapter(I2C_BUS_AVAILABLE);
-
-    if (adxl_i2c_adapter != NULL) {
-        adxl_i2c_client = i2c_new_probed_device(adxl_i2c_adapter, &adxl_i2c_board_info, i2c_addresses, NULL);
-
-        if (adxl_i2c_client != NULL) {
-            i2c_add_driver(&adxl_driver);
-            pr_info("ADXL345 Driver Added!!!\n");
-
-            // Allocate a character device
-            ret = alloc_chrdev_region(&dev_number, 0, 1, SLAVE_DEVICE_NAME);
-            if (ret < 0) {
-                pr_err("Failed to allocate major and minor numbers\n");
-                return ret;
-            }
-            major = MAJOR(dev_number);
-            minor = MINOR(dev_number);
-            pr_info("Allocated character device: major=%d, minor=%d\n", major, minor);
-
-            ret = 0;
-        } else {
-            pr_info("ADXL345 client not found!!!\n");
-        }
-
-        i2c_put_adapter(adxl_i2c_adapter);
-    } else {
-        pr_info("I2C Bus Adapter Not Available!!!\n");
-    }
-
-    return ret;
-}
-
-static void adxl_driver_exit(void)
-{
-    if (adxl_i2c_client != NULL) {
-        i2c_unregister_device(adxl_i2c_client);
-        i2c_del_driver(&adxl_driver);
-
-        // Release the character device
-        unregister_chrdev_region(dev_number, 1);
-        pr_info("Released character device: major=%d, minor=%d\n", major, minor);
-    }
-    pr_info("ADXL345 Driver Removed!!!\n");
-}
-
-module_init(adxl_driver_init);
-module_exit(adxl_driver_exit);
+module_i2c_driver(adxl_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kiran <sasikiran021@gmail.com>");
 MODULE_DESCRIPTION("ADXL345 Accelerometer I2C Driver");
-
 
